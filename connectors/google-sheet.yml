@@ -1,0 +1,35 @@
+{
+  "id": "google-sheet",
+  "name": "Google Sheets",
+  "description": "Import a Google Sheet as CSV or a markdown table via gws.",
+  "refs": [
+    {
+      "pattern": "https://docs\\.google\\.com/spreadsheets/d/(?P<id>[^/]+)",
+      "source-ref": "{{url}}",
+      "source-id": "{{id}}"
+    }
+  ],
+  "auth": {
+    "check": { "run": "gws auth status" },
+    "setup": { "instructions": "Run: gws auth login -s drive,sheets" }
+  },
+  "capabilities": { "discover": true, "fetch": true, "refresh": true },
+  "discover": {
+    "run": "gws drive files list --params '{\"q\":\"fullText contains \\\"{{query}}\\\" and mimeType=\\\"application/vnd.google-apps.spreadsheet\\\"\",\"pageSize\":{{limit}},\"fields\":\"files(id,name,mimeType,modifiedTime,webViewLink)\"}'",
+    "output": "json"
+  },
+  "fetch": {
+    "run": "gws drive files export --params '{\"fileId\":\"{{source_id}}\",\"mimeType\":\"text/csv\"}' -o '{{tmp_body}}'",
+    "body": { "file": "{{tmp_body}}" }
+  },
+  "refresh": {
+    "check": {
+      "run": "gws drive files get --params '{\"fileId\":\"{{source_id}}\",\"fields\":\"id,name,mimeType,modifiedTime\"}'",
+      "output": "json",
+      "updated-at": "$.modifiedTime"
+    }
+  },
+  "normalize": { "kind": "csv" },
+  "tracking": { "identity": "{{source_id}}", "cursor": "none" },
+  "metadata": { "title": "$.name", "source-updated": "$.modifiedTime" }
+}

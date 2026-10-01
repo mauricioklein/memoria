@@ -1,0 +1,38 @@
+{
+  "id": "gmail",
+  "name": "Gmail",
+  "description": "Import a Gmail message or thread via gws.",
+  "refs": [
+    {
+      "pattern": "gmail-thread:(?P<thread_id>[A-Za-z0-9_-]+)",
+      "source-ref": "gmail-thread:{{thread_id}}",
+      "source-id": "{{thread_id}}"
+    },
+    {
+      "pattern": "gmail-message:(?P<message_id>[A-Za-z0-9_-]+)",
+      "source-ref": "gmail-message:{{message_id}}",
+      "source-id": "{{message_id}}"
+    }
+  ],
+  "auth": {
+    "check": { "run": "gws auth status" },
+    "setup": { "instructions": "Run: gws auth login -s gmail" }
+  },
+  "capabilities": { "discover": true, "fetch": true, "refresh": true },
+  "discover": {
+    "run": "gws gmail users messages list --params '{\"userId\":\"me\",\"q\":\"{{query}}\",\"maxResults\":{{limit}}}'",
+    "output": "json"
+  },
+  "fetch": {
+    "run": "gws gmail users threads get --params '{\"userId\":\"me\",\"id\":\"{{source_id}}\",\"format\":\"full\"}'",
+    "body": { "file": "{{tmp_body}}" }
+  },
+  "refresh": {
+    "check": {
+      "run": "gws gmail users threads get --params '{\"userId\":\"me\",\"id\":\"{{source_id}}\",\"format\":\"metadata\"}'",
+      "output": "json"
+    }
+  },
+  "normalize": { "kind": "gmail-thread" },
+  "tracking": { "identity": "{{source_id}}", "cursor": "none" }
+}

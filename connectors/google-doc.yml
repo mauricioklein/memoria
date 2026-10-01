@@ -1,0 +1,35 @@
+{
+  "id": "google-doc",
+  "name": "Google Docs",
+  "description": "Import a Google Doc as markdown via gws drive export.",
+  "refs": [
+    {
+      "pattern": "https://docs\\.google\\.com/document/d/(?P<id>[^/]+)",
+      "source-ref": "{{url}}",
+      "source-id": "{{id}}"
+    }
+  ],
+  "auth": {
+    "check": { "run": "gws auth status" },
+    "setup": { "instructions": "Run: gws auth login -s drive,docs" }
+  },
+  "capabilities": { "discover": true, "fetch": true, "refresh": true },
+  "discover": {
+    "run": "gws drive files list --params '{\"q\":\"fullText contains \\\"{{query}}\\\" and mimeType=\\\"application/vnd.google-apps.document\\\"\",\"pageSize\":{{limit}},\"fields\":\"files(id,name,mimeType,modifiedTime,webViewLink)\"}'",
+    "output": "json"
+  },
+  "fetch": {
+    "run": "gws drive files export --params '{\"fileId\":\"{{source_id}}\",\"mimeType\":\"text/markdown\"}' -o '{{tmp_body}}'",
+    "body": { "file": "{{tmp_body}}" }
+  },
+  "refresh": {
+    "check": {
+      "run": "gws drive files get --params '{\"fileId\":\"{{source_id}}\",\"fields\":\"id,name,mimeType,modifiedTime\"}'",
+      "output": "json",
+      "updated-at": "$.modifiedTime"
+    }
+  },
+  "normalize": { "kind": "markdown" },
+  "tracking": { "identity": "{{source_id}}", "cursor": "none" },
+  "metadata": { "title": "$.name", "source-updated": "$.modifiedTime" }
+}

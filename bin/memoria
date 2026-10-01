@@ -1,0 +1,1289 @@
+#!/usr/bin/env python3
+"""memoria — deterministic CLI for the Memoria knowledge workspace.
+
+Owns the mechanical, judgment-free operations the Memoria agent adapters delegate:
+project scaffolding, resource writes, inventory rebuilds, log appends, status output,
+connector inspection, and harness/connector setup.
+
+stdlib only, no third-party deps.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import date, datetime, timezone
+
+# --------------------------------------------------------------------------- #
+# Paths
+# --------------------------------------------------------------------------- #
+
+SCRIPT_PATH = os.path.abspath(__file__)
+SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+LIB_DIR = os.path.join(REPO_ROOT, "lib")
+if LIB_DIR not in sys.path:
+    sys.path.insert(0, LIB_DIR)
+
+import memoria_rag
+
+
+def docs_dir():
+    return os.path.join(REPO_ROOT, "docs")
+
+
+def connectors_dir():
+    return os.path.join(REPO_ROOT, "connectors")
+
+
+def adapters_dir():
+    return os.path.join(REPO_ROOT, "adapters")
+
+
+def projects_dir():
+    return os.path.join(REPO_ROOT, "projects")
+
+
+def project_dir(slug):
+    return os.path.join(projects_dir(), slug)
+
+
+def require_project(slug):
+    path = project_dir(slug)
+    if not os.path.isdir(path):
+        die("project not found: projects/%s/ (looked in %s)" % (slug, path))
+    return path
+
+
+def die(msg, code=1):
+    sys.stderr.write("memoria: error: %s\n" % msg)
+    sys.exit(code)
+
+
+def relpath(path, base):
+    return os.path.relpath(path, base).replace(os.sep, "/")
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# Time + slugs
+# --------------------------------------------------------------------------- #
+
+
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def today_iso():
+    return date.today().isoformat()
+
+
+def slugify(text):
+    text = re.sub(r"[^a-z0-9]+", "-", (text or "").strip().lower())
+    return text.strip("-") or "untitled"
+
+
+def split_csv(value):
+    if not value:
+        return []
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+# --------------------------------------------------------------------------- #
+# Frontmatter — line-based reader/emitter for the one-line-per-field contract
+# --------------------------------------------------------------------------- #
+
+KNOWN_ORDER = [
+    "title",
+    "type",
+    "source",
+    "source-ref",
+    "source-id",
+    "connector",
+    "source-created",
+    "source-updated",
+    "source-cursor",
+    "tags",
+    "created",
+    "updated",
+    "summary",
+]
+
+
+def parse_frontmatter(text):
+    """Return (fields_dict, body). fields_dict is None when there is no
+    parseable `---`-fenced frontmatter block. Unknown keys are preserved."""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None, text
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return None, text
+    fields = {}
+    for line in lines[1:end]:
+        if not line.strip():
+            continue
+        m = re.match(r"^([A-Za-z0-9_-]+):(?:\s+(.*))?$", line)
+        if not m:
+            continue
+        fields[m.group(1)] = _parse_scalar((m.group(2) or "").strip())
+    body = "\n".join(lines[end + 1:])
+    if body.startswith("\n"):
+        body = body[1:]
+    return fields, body
+
+
+def _parse_scalar(raw):
+    if raw == "":
+        return ""
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return []
+        return [x.strip().strip('"').strip("'") for x in inner.split(",") if x.strip()]
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        return raw[1:-1].replace('\\"', '"')
+    if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
+        return raw[1:-1].replace("''", "'")
+    return raw
+
+
+def _needs_quoting(s):
+    if s == "" or s != s.strip():
+        return True
+    if s[0] in "!&*?{}[]#|>@`\"'%,:-":
+        return True
+    if ":" in s or " #" in s or "\n" in s:
+        return True
+    return False
+
+
+def emit_scalar(s):
+    s = "" if s is None else str(s)
+    if _needs_quoting(s):
+        return '"' + s.replace('"', '\\"') + '"'
+    return s
+
+
+def emit_field(key, value):
+    if isinstance(value, list):
+        return "%s: [%s]" % (key, ", ".join(value))
+    return "%s: %s" % (key, emit_scalar(value))
+
+
+def emit_frontmatter(fields, body):
+    lines = ["---"]
+    extras = [k for k in fields if k not in KNOWN_ORDER]
+    for key in KNOWN_ORDER + extras:
+        if key in fields:
+            lines.append(emit_field(key, fields[key]))
+    lines.append("---")
+    fm = "\n".join(lines)
+    body = (body or "").strip("\n")
+    return fm + "\n\n" + body + "\n" if body else fm + "\n"
+
+
+def split_fm_block(text):
+    lines = text.split("\n")
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return None, text
+    body = "\n".join(lines[end + 1:])
+    if body.startswith("\n"):
+        body = body[1:]
+    return lines[1:end], body
+
+
+def set_fm_line(inner, key, rendered_value):
+    new_line = "%s: %s" % (key, rendered_value)
+    for i, line in enumerate(inner):
+        m = re.match(r"^([A-Za-z0-9_-]+):", line)
+        if m and m.group(1) == key:
+            inner[i] = new_line
+            return
+    inner.append(new_line)
+
+
+# --------------------------------------------------------------------------- #
+# Log
+# --------------------------------------------------------------------------- #
+
+LOG_ORDER = ["ts", "kind", "resource", "summary", "tags", "corrects"]
+
+
+def append_log(slug, kind, summary, tags=None, resource=None, corrects=None):
+    entry = {"ts": utc_now(), "kind": kind, "summary": summary, "tags": tags or []}
+    if resource:
+        entry["resource"] = resource
+    if corrects:
+        entry["corrects"] = corrects
+    ordered = {k: entry[k] for k in LOG_ORDER if k in entry}
+    line = json.dumps(ordered, ensure_ascii=False, separators=(",", ":"))
+    with open(os.path.join(project_dir(slug), "log.jsonl"), "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    return line
+
+
+def read_log(slug, limit=None):
+    path = os.path.join(project_dir(slug), "log.jsonl")
+    entries = []
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except ValueError:
+                    pass
+    return entries[-limit:] if limit else entries
+
+
+# --------------------------------------------------------------------------- #
+# Resource scanning + inventory
+# --------------------------------------------------------------------------- #
+
+INVENTORY_PREAMBLE = (
+    "# Inventory\n\n"
+    "Auto-generated by `memoria rebuild-inventory`. Do not edit by hand — "
+    "edit frontmatter on the resource files instead and re-run the command.\n"
+)
+TABLE_HEADER = (
+    "| path | type | source | tags | summary | updated |\n"
+    "|---|---|---|---|---|---|\n"
+)
+
+
+def scan_resources(pdir):
+    resources = os.path.join(pdir, "resources")
+    md_files = []
+    if os.path.isdir(resources):
+        for root, dirs, files in os.walk(resources):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fn in files:
+                if fn.endswith(".md"):
+                    md_files.append(os.path.join(root, fn))
+    items, missing = [], []
+    for path in sorted(md_files, key=lambda p: relpath(p, pdir)):
+        rel = relpath(path, pdir)
+        with open(path, encoding="utf-8") as f:
+            fields, _ = parse_frontmatter(f.read())
+        if not fields or not fields.get("title"):
+            missing.append(rel)
+            continue
+        fields["__rel__"] = rel
+        items.append(fields)
+    return items, missing
+
+
+def _cell(value):
+    if isinstance(value, list):
+        value = ", ".join(value)
+    return ("" if value is None else str(value)).replace("\n", " ").replace("|", "\\|").strip()
+
+
+def rebuild_inventory(slug):
+    pdir = project_dir(slug)
+    items, missing = scan_resources(pdir)
+    rows = []
+    for it in items:
+        rows.append("| " + " | ".join(_cell(x) for x in [
+            it["__rel__"], it.get("type", ""), it.get("source", ""),
+            it.get("tags", ""), it.get("summary", ""), it.get("updated", ""),
+        ]) + " |")
+    out = INVENTORY_PREAMBLE
+    if rows:
+        out += "\n" + TABLE_HEADER + "\n".join(rows) + "\n"
+    else:
+        out += "\n_(no resources yet)_\n\n" + TABLE_HEADER
+    if missing:
+        out += "\n## Files missing frontmatter\n\n"
+        out += "\n".join("- " + m for m in missing) + "\n"
+    with open(os.path.join(pdir, "inventory.md"), "w", encoding="utf-8") as f:
+        f.write(out)
+    return len(rows), missing
+
+
+# --------------------------------------------------------------------------- #
+# Markdown section helpers (for status)
+# --------------------------------------------------------------------------- #
+
+
+def extract_section(md, name):
+    out, capture = [], False
+    for line in md.split("\n"):
+        if re.match(r"^#{1,6}\s+" + re.escape(name) + r"\s*$", line):
+            capture = True
+            continue
+        if capture and re.match(r"^#{1,6}\s+", line):
+            break
+        if capture:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def parse_sections(md):
+    sections, cur = [], None
+    for line in md.split("\n"):
+        m = re.match(r"^##\s+(.*?)\s*$", line)
+        if m:
+            cur = [m.group(1), []]
+            sections.append(cur)
+        elif cur is not None:
+            cur[1].append(line)
+    return [(h, [ln for ln in body]) for h, body in sections]
+
+
+def bullet_date(line):
+    m = re.match(r"^\s*[-*]\s*\*{0,2}(\d{4}-\d{2}-\d{2})", line)
+    return m.group(1) if m else None
+
+
+def parse_iso(d):
+    try:
+        return date.fromisoformat(d)
+    except (ValueError, TypeError):
+        return None
+
+
+def days_between(a, b):
+    return (a - b).days
+
+
+# --------------------------------------------------------------------------- #
+# Connector loading + matching
+# --------------------------------------------------------------------------- #
+
+
+def load_json_file(path):
+    with open(path, encoding="utf-8") as f:
+        text = f.read().strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        die("failed to parse %s as JSON-compatible YAML: %s" % (path, exc))
+
+
+def load_connectors():
+    out = []
+    cdir = connectors_dir()
+    if not os.path.isdir(cdir):
+        return out
+    for name in sorted(os.listdir(cdir)):
+        if not name.endswith(('.yml', '.yaml', '.json')):
+            continue
+        path = os.path.join(cdir, name)
+        data = load_json_file(path)
+        if not isinstance(data, dict):
+            die("connector file must contain an object: %s" % path)
+        data.setdefault("id", os.path.splitext(name)[0])
+        data["__path__"] = path
+        out.append(data)
+    return out
+
+
+def connector_by_id(connector_id):
+    for connector in load_connectors():
+        if connector.get("id") == connector_id:
+            return connector
+    return None
+
+
+def render_template(text, values):
+    def repl(match):
+        key = match.group(1)
+        return str(values.get(key, ""))
+    return re.sub(r"\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}", repl, text or "")
+
+
+def default_source_id_template(pattern, ref_pattern):
+    if pattern:
+        return pattern
+    group_names = re.findall(r"\(\?P<([A-Za-z0-9_]+)>", ref_pattern or "")
+    for preferred in ["id", "source_id", "page_id", "file_id", "thread_id", "channel_id", "number"]:
+        if preferred in group_names:
+            return "{{%s}}" % preferred
+    return "{{url}}"
+
+
+def match_connector_ref(connector, ref):
+    for spec in connector.get("refs", []):
+        pattern = spec.get("pattern")
+        if not pattern:
+            continue
+        m = re.search(pattern, ref)
+        if not m:
+            continue
+        groups = m.groupdict()
+        values = {"ref": ref, "url": ref}
+        values.update(groups)
+        source_ref = render_template(spec.get("source-ref") or "{{url}}", values)
+        source_id = render_template(spec.get("source-id") or "", values)
+        cpath = connector.get("__path__") or ""
+        if cpath and (cpath == REPO_ROOT or cpath.startswith(REPO_ROOT + os.sep)):
+            cpath = relpath(cpath, REPO_ROOT)
+        return {
+            "connector": connector.get("id"),
+            "name": connector.get("name", connector.get("id")),
+            "pattern": pattern,
+            "groups": groups,
+            "source-ref": source_ref,
+            "source-id": source_id,
+            "connector-path": cpath,
+        }
+    return None
+
+
+def match_ref(ref, connector_id=None):
+    matches = []
+    for connector in load_connectors():
+        if connector_id and connector.get("id") != connector_id:
+            continue
+        hit = match_connector_ref(connector, ref)
+        if hit:
+            matches.append(hit)
+    return matches
+
+
+# --------------------------------------------------------------------------- #
+# Harness adapter setup
+# --------------------------------------------------------------------------- #
+
+HARNESSES = ["claude", "pi", "codex", "opencode", "generic"]
+
+
+def template_files(root):
+    files = []
+    for walk_root, _, names in os.walk(root):
+        for name in sorted(names):
+            path = os.path.join(walk_root, name)
+            files.append((path, relpath(path, root)))
+    return files
+
+
+def render_adapter_text(text, harness):
+    values = {
+        "HARNESS": harness,
+        "BIN_PATH": "bin/memoria",
+        "CONTRACT_PATH": "docs/memoria-contract.md",
+        "AGENTS_PATH": "docs/rag.md",
+        "CONNECTORS_PATH": "docs/connectors.md",
+        "HARNESSES_PATH": "docs/rag.md",
+    }
+    return render_template(text, values)
+
+
+def append_gitignore_entries(dest_root, rels, dry_run=False):
+    if not rels:
+        return False
+    path = os.path.join(dest_root, ".gitignore")
+    existing = []
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            existing = [ln.rstrip("\n") for ln in f]
+    wanted = [r for r in rels if r not in existing]
+    if not wanted:
+        return False
+    if dry_run:
+        return True
+    lines = []
+    if existing and existing[-1] != "":
+        lines.append("")
+    if "# Memoria generated adapters" not in existing:
+        lines.append("# Memoria generated adapters")
+    lines.extend(wanted)
+    with open(path, "a", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Setup prompts
+# --------------------------------------------------------------------------- #
+
+
+def prompt(text, default=None):
+    if not sys.stdin.isatty():
+        if default is not None:
+            return default
+        die("missing required input: %s" % text)
+    suffix = ""
+    if default not in (None, ""):
+        suffix = " [%s]" % default
+    value = input(text + suffix + ": ").strip()
+    return value or (default if default is not None else "")
+
+
+def prompt_bool(text, default=True):
+    default_text = "Y/n" if default else "y/N"
+    while True:
+        raw = prompt(text + " (%s)" % default_text, "").lower()
+        if raw == "":
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("Please answer yes or no.")
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: rebuild-inventory
+# --------------------------------------------------------------------------- #
+
+
+def cmd_rebuild_inventory(args):
+    require_project(args.project)
+    count, missing = rebuild_inventory(args.project)
+    if not args.no_log:
+        append_log(args.project, "note",
+                   "Inventory rebuilt: %d resources indexed" % count,
+                   ["inventory", "auto"])
+    print("Rebuilt projects/%s/inventory.md — %d resources indexed, %d missing frontmatter"
+          % (args.project, count, len(missing)))
+    if missing:
+        print("\nFiles missing frontmatter (add frontmatter via memoria:record-entry):")
+        for m in missing:
+            print("  - " + m)
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: status (read-only)
+# --------------------------------------------------------------------------- #
+
+
+def cmd_status(args):
+    pdir = require_project(args.project)
+    today = date.today()
+    attention = []
+
+    meta, goal = {}, ""
+    readme = os.path.join(pdir, "README.md")
+    if os.path.isfile(readme):
+        with open(readme, encoding="utf-8") as f:
+            fields, body = parse_frontmatter(f.read())
+        meta = fields or {}
+        goal = extract_section(body, "Goal")
+    updated = parse_iso(meta.get("updated"))
+    if updated and days_between(today, updated) > 30:
+        attention.append("Project is stale — README `updated` is %s (%d days ago)."
+                         % (meta.get("updated"), days_between(today, updated)))
+
+    tracker_dir = os.path.join(pdir, "resources", "tracker")
+    tracker_blocks = []
+    if os.path.isdir(tracker_dir):
+        for fn in sorted(os.listdir(tracker_dir)):
+            if not fn.endswith(".md"):
+                continue
+            with open(os.path.join(tracker_dir, fn), encoding="utf-8") as f:
+                _, body = parse_frontmatter(f.read())
+            for header, lines in parse_sections(body):
+                entries = [ln for ln in lines if ln.strip()]
+                if not entries:
+                    continue
+                tracker_blocks.append((header, entries))
+                hl = header.lower()
+                for ln in entries:
+                    d = parse_iso(bullet_date(ln))
+                    if d is None:
+                        continue
+                    if "blocker" in hl and days_between(today, d) > 14:
+                        attention.append("Stale blocker (%d days): %s" % (days_between(today, d), ln.strip()))
+                    if "deadline" in hl:
+                        delta = days_between(d, today)
+                        if delta < 0:
+                            attention.append("Past-due deadline (%s): %s" % (d.isoformat(), ln.strip()))
+                        elif delta <= 7:
+                            attention.append("Deadline in %d days (%s): %s" % (delta, d.isoformat(), ln.strip()))
+
+    recent = read_log(args.project, args.log_limit)
+    items, _ = scan_resources(pdir)
+
+    lines = []
+    lines.append("# %s" % (meta.get("title") or args.project))
+    lines.append("")
+    lines.append("Owner:   %s" % meta.get("owner", ""))
+    lines.append("Status:  %s" % meta.get("status", ""))
+    lines.append("Created: %s   Updated: %s" % (meta.get("created", ""), meta.get("updated", "")))
+    lines.append("Path:    projects/%s/" % args.project)
+    if goal:
+        lines += ["", "## Goal", goal]
+    if tracker_blocks:
+        lines += ["", "## Tracker"]
+        for header, entries in tracker_blocks:
+            lines += ["", "### %s" % header] + entries
+    else:
+        lines += ["", "No tracker set up — run memoria:record-entry and choose Tracker update to start one."]
+    if recent:
+        lines += ["", "## Recent activity (last %d log entries)" % len(recent)]
+        for e in recent:
+            summary = e.get("summary", "")
+            if len(summary) > 80:
+                summary = summary[:77] + "..."
+            lines.append("- %s  %s  — %s" % (e.get("ts", ""), e.get("kind", ""), summary))
+    lines += ["", "## Inventory",
+              "%d resources cataloged. See projects/%s/inventory.md for the full index."
+              % (len(items), args.project)]
+    if attention:
+        lines += ["", "## ⚠ Attention"] + ["- " + a for a in attention]
+    print("\n".join(lines))
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: log
+# --------------------------------------------------------------------------- #
+
+
+def cmd_log(args):
+    require_project(args.project)
+    line = append_log(args.project, args.kind, args.summary,
+                      split_csv(args.tags), args.resource, args.corrects)
+    if not args.quiet:
+        print(line)
+
+
+# --------------------------------------------------------------------------- #
+# Body input (shared by new-resource / update-resource)
+# --------------------------------------------------------------------------- #
+
+
+def read_body(args):
+    if args.body_file:
+        with open(args.body_file, encoding="utf-8") as f:
+            return f.read()
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: new-resource
+# --------------------------------------------------------------------------- #
+
+
+def cmd_new_resource(args):
+    pdir = require_project(args.project)
+    body = read_body(args)
+    created = args.created or today_iso()
+    cat_dir = os.path.join(pdir, "resources", args.category)
+    os.makedirs(cat_dir, exist_ok=True)
+
+    if args.filename:
+        fn = args.filename if args.filename.endswith(".md") else args.filename + ".md"
+    else:
+        fn = "%s-%s.md" % (created, slugify(args.title))
+    base, ext = os.path.splitext(fn)
+    path = os.path.join(cat_dir, fn)
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(cat_dir, "%s-%d%s" % (base, n, ext))
+        n += 1
+
+    fields = {
+        "title": args.title,
+        "type": args.type,
+        "source": args.source,
+        "source-ref": args.source_ref,
+        "tags": split_csv(args.tags),
+        "created": created,
+        "updated": created,
+        "summary": args.summary or "",
+    }
+    if args.source_id:
+        fields["source-id"] = args.source_id
+    if args.connector:
+        fields["connector"] = args.connector
+    if args.source_created:
+        fields["source-created"] = args.source_created
+    if args.source_updated:
+        fields["source-updated"] = args.source_updated
+    if args.source_cursor:
+        fields["source-cursor"] = args.source_cursor
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(emit_frontmatter(fields, body))
+
+    rel = relpath(path, pdir)
+    append_log(args.project, "resource.added", args.summary or args.title, fields["tags"], rel)
+    if args.fetch_log:
+        append_log(args.project, "fetch.completed",
+                   "Fetched from %s: %s" % (args.source, args.source_ref),
+                   ["fetch", args.source], rel)
+    if not args.no_inventory:
+        rebuild_inventory(args.project)
+    print("Wrote %s" % rel)
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: update-resource
+# --------------------------------------------------------------------------- #
+
+
+def cmd_update_resource(args):
+    pdir = require_project(args.project)
+    path = args.path if os.path.isabs(args.path) else os.path.join(pdir, args.path)
+    if not os.path.isfile(path):
+        die("resource not found: %s" % args.path)
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    fields, _ = parse_frontmatter(text)
+    if fields is None:
+        die("resource has no frontmatter: %s" % args.path)
+    inner, _ = split_fm_block(text)
+    new_body = read_body(args)
+
+    set_fm_line(inner, "updated", args.updated or today_iso())
+    if args.summary is not None:
+        set_fm_line(inner, "summary", emit_scalar(args.summary))
+    if args.title is not None:
+        set_fm_line(inner, "title", emit_scalar(args.title))
+    if args.tags is not None:
+        set_fm_line(inner, "tags", "[%s]" % ", ".join(split_csv(args.tags)))
+    if args.connector is not None:
+        set_fm_line(inner, "connector", emit_scalar(args.connector))
+    if args.source_id is not None:
+        set_fm_line(inner, "source-id", emit_scalar(args.source_id))
+    if args.source_updated is not None:
+        set_fm_line(inner, "source-updated", emit_scalar(args.source_updated))
+    if args.source_cursor is not None:
+        set_fm_line(inner, "source-cursor", emit_scalar(args.source_cursor))
+
+    rebuilt = "---\n" + "\n".join(inner) + "\n---\n\n" + new_body.strip("\n") + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(rebuilt)
+
+    rel = relpath(path, pdir)
+    source = args.source or fields.get("source") or "unknown"
+    append_log(args.project, "resource.updated", args.change, ["refresh", source], rel)
+    if not args.no_inventory:
+        rebuild_inventory(args.project)
+    print("Updated %s" % rel)
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: init
+# --------------------------------------------------------------------------- #
+
+README_TAIL = """## Retrieval workflow
+
+When you need project context, start with the local RAG index instead of broad scanning:
+
+1. `bin/memoria rag rebuild --project <slug>` after major content changes or right after setup
+2. `bin/memoria rag search --project <slug> --query "..." --format context --limit 8`
+3. Read the returned snippets/files first
+4. Expand with `bin/memoria rag related --project <slug> --path <file>` if needed
+5. Fall back to broad file scanning only when retrieval is weak
+
+You can also scaffold harness instructions with:
+
+- `bin/memoria setup agent --harness pi`
+- `bin/memoria setup agent --harness claude`
+
+## Resource categories
+
+Categories live as folders under `resources/`. Common starters (none are required):
+
+- `knowledge-base/` — durable reference material
+- `notes/` — meeting notes, async write-ups, observations
+- `decisions/` — decisions made, with context and tradeoffs
+- `conversations/` — captured threads (Slack, email, chats)
+- `tracker/` — progress, blockers, deadlines, achievements, todos
+- `contacts/` — people and teams to coordinate with
+- `contributions/` — per-person participation notes (`<person>.md`), report-ready for performance reviews
+
+Add new categories as folders on demand — nothing here is hardcoded.
+
+## See also
+
+- [`inventory.md`](./inventory.md) — generated catalog of all resources
+- [`log.jsonl`](./log.jsonl) — append-only activity log
+- [`../../docs/rag.md`](../../docs/rag.md) — local retrieval commands and agent workflow
+"""
+
+
+def build_readme(slug, args, created):
+    p = ["---",
+         "project: %s" % slug,
+         "title: %s" % emit_scalar(args.title),
+         "owner: %s" % emit_scalar(args.owner),
+         "status: %s" % (args.status or "discovery"),
+         "created: %s" % created,
+         "updated: %s" % created,
+         "---",
+         "",
+         "# %s" % args.title,
+         ""]
+    desc = args.description or args.goal
+    if desc:
+        p += [desc, ""]
+    p += ["## Goal", "", args.goal or "_TBD_", ""]
+    p += ["## Status", "", args.status or "discovery", ""]
+    if args.key_link:
+        p += ["## Key links", ""]
+        for kl in args.key_link:
+            label, _, url = kl.partition("=")
+            p.append("- %s: %s" % (label.strip(), url.strip()))
+        p.append("")
+    p += ["## People", "", "- **Owner:** %s" % args.owner]
+    if args.collaborator:
+        p.append("- **Collaborators:** %s" % ", ".join(args.collaborator))
+    if args.stakeholder:
+        p.append("- **Stakeholders:** %s" % ", ".join(args.stakeholder))
+    p.append("")
+    if args.glossary:
+        p += ["## Glossary", ""]
+        for g in args.glossary:
+            term, _, definition = g.partition("=")
+            p.append("- **%s:** %s" % (term.strip(), definition.strip()))
+        p.append("")
+    return "\n".join(p) + "\n" + README_TAIL
+
+
+def parse_contributor(value):
+    name, sep, slug = value.partition("=")
+    name = name.strip()
+    return name, (slug.strip() if sep else slugify(name))
+
+
+def seed_contributions(tmpl_path, contrib_dir, person, person_slug, project_title, created):
+    if not os.path.isfile(tmpl_path):
+        return
+    with open(tmpl_path, encoding="utf-8") as f:
+        text = f.read()
+    text = (text.replace("<Person>", person)
+                .replace("<Project Name>", project_title)
+                .replace("<person-slug>", person_slug)
+                .replace("<YYYY-MM-DD>", created))
+    with open(os.path.join(contrib_dir, "%s.md" % person_slug), "w", encoding="utf-8") as f:
+        f.write(text)
+    os.remove(tmpl_path)
+
+
+def cmd_init(args):
+    slug = args.project
+    pdir = project_dir(slug)
+    if os.path.exists(pdir):
+        die("project already exists: projects/%s/ (never overwrites)" % slug)
+    template = os.path.join(projects_dir(), "_template")
+    if not os.path.isdir(template):
+        die("template not found: %s" % template)
+
+    shutil.copytree(template, pdir)
+    created = args.created or today_iso()
+
+    with open(os.path.join(pdir, "README.md"), "w", encoding="utf-8") as f:
+        f.write(build_readme(slug, args, created))
+
+    contrib_dir = os.path.join(pdir, "resources", "contributions")
+    tmpl_contrib = os.path.join(contrib_dir, "_template.md")
+    if args.no_contributions:
+        if os.path.isfile(tmpl_contrib):
+            os.remove(tmpl_contrib)
+    else:
+        person, person_slug = parse_contributor(args.contributor or args.owner)
+        seed_contributions(tmpl_contrib, contrib_dir, person, person_slug, args.title, created)
+
+    append_log(slug, "note", "Project created", ["bootstrap"])
+    count, _ = rebuild_inventory(slug)
+
+    print("Created projects/%s/  (%d resource(s) indexed)" % (slug, count))
+    print("")
+    print("Next steps:")
+    print("- memoria:record-entry      → add a note, log an event, or update the tracker")
+    print("- memoria:sync-sources      → pull content from connectors / external sources")
+    print("- memoria:show-status       → render a status snapshot")
+    print("- memoria:rebuild-inventory → rebuild the resource index")
+    print("- bin/memoria rag rebuild --project %s" % slug)
+    print("- bin/memoria rag search --project %s --query \"...\" --format context --limit 8" % slug)
+    print("- bin/memoria setup agent --harness pi")
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: connector helpers
+# --------------------------------------------------------------------------- #
+
+
+def cmd_connector_list(args):
+    connectors = load_connectors()
+    if not connectors:
+        print("No connectors found in %s" % relpath(connectors_dir(), REPO_ROOT))
+        return
+    for connector in connectors:
+        caps = connector.get("capabilities", {})
+        enabled = [name for name in ["discover", "fetch", "refresh"] if caps.get(name)]
+        print("- %s" % connector.get("id"))
+        print("  name: %s" % connector.get("name", ""))
+        print("  capabilities: %s" % (", ".join(enabled) if enabled else "none"))
+        print("  path: %s" % relpath(connector.get("__path__"), REPO_ROOT))
+        if connector.get("description"):
+            print("  description: %s" % connector.get("description"))
+
+
+def cmd_connector_show(args):
+    connector = connector_by_id(args.id)
+    if not connector:
+        die("connector not found: %s" % args.id)
+    payload = dict(connector)
+    if payload.get("__path__"):
+        payload["__path__"] = relpath(payload["__path__"], REPO_ROOT)
+    print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=False))
+
+
+def cmd_connector_match(args):
+    matches = match_ref(args.ref, args.connector)
+    if args.json:
+        print(json.dumps(matches, indent=2, ensure_ascii=False))
+        return
+    if not matches:
+        print("No connector matched: %s" % args.ref)
+        return
+    for match in matches:
+        print("- %s" % match["connector"])
+        print("  name: %s" % match.get("name", ""))
+        print("  source-ref: %s" % match.get("source-ref", ""))
+        if match.get("source-id"):
+            print("  source-id: %s" % match.get("source-id"))
+        if match.get("groups"):
+            print("  groups: %s" % json.dumps(match.get("groups"), ensure_ascii=False, sort_keys=True))
+        if match.get("connector-path"):
+            print("  path: %s" % match.get("connector-path"))
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: setup agent
+# --------------------------------------------------------------------------- #
+
+
+def cmd_setup_agent(args):
+    harness = args.harness or prompt("Harness", "claude")
+    if harness not in HARNESSES:
+        die("unsupported harness: %s (choose from %s)" % (harness, ", ".join(HARNESSES)))
+
+    template_root = os.path.join(adapters_dir(), harness, "files")
+    if not os.path.isdir(template_root):
+        die("adapter template not found: %s" % template_root)
+
+    dest_root = os.path.abspath(args.dest or REPO_ROOT)
+    files = template_files(template_root)
+    generated, updated, skipped = [], [], []
+
+    for src, rel in files:
+        target = os.path.join(dest_root, rel)
+        ensure_dir(os.path.dirname(target))
+        with open(src, encoding="utf-8") as f:
+            content = render_adapter_text(f.read(), harness)
+
+        exists = os.path.exists(target)
+        if exists and args.mode == "abort":
+            die("target already exists: %s" % target)
+        if exists and args.mode == "skip":
+            skipped.append(relpath(target, dest_root))
+            continue
+
+        if not args.dry_run:
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
+        if exists:
+            updated.append(relpath(target, dest_root))
+        else:
+            generated.append(relpath(target, dest_root))
+
+    ignored = False
+    generated_paths = generated + updated
+    if args.tracking == "ignore":
+        ignored = append_gitignore_entries(dest_root, generated_paths, args.dry_run)
+
+    print("Harness: %s" % harness)
+    print("Destination: %s" % dest_root)
+    if args.dry_run:
+        print("Mode: dry-run")
+    if generated:
+        print("Generated:")
+        for path in generated:
+            print("- %s" % path)
+    if updated:
+        print("Updated:")
+        for path in updated:
+            print("- %s" % path)
+    if skipped:
+        print("Skipped:")
+        for path in skipped:
+            print("- %s" % path)
+    if args.tracking == "ignore" and ignored:
+        print("Ignored in .gitignore:")
+        for path in generated_paths:
+            print("- %s" % path)
+    elif args.tracking == "local-only":
+        print("Tracking: local-only requested — files were generated, but local ignore rules were not edited automatically.")
+    elif args.tracking == "commit":
+        print("Tracking: commit (no ignore rules added)")
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: setup connector
+# --------------------------------------------------------------------------- #
+
+
+def cmd_setup_connector(args):
+    connector_id = args.id or prompt("Connector id")
+    name = args.name or prompt("Connector name", connector_id)
+    description = args.description or prompt("Description", "")
+
+    ref_patterns = list(args.ref_pattern or [])
+    if not ref_patterns:
+        first = prompt("Reference pattern (regex)")
+        if first:
+            ref_patterns.append(first)
+        while prompt_bool("Add another reference pattern?", False):
+            ref_patterns.append(prompt("Reference pattern (regex)"))
+
+    if not ref_patterns:
+        die("at least one --ref-pattern is required")
+
+    source_ref_template = args.source_ref_template or prompt("source-ref template", "{{url}}")
+    source_id_template = default_source_id_template(args.source_id_template, ref_patterns[0])
+    if args.source_id_template is None and sys.stdin.isatty():
+        source_id_template = prompt("source-id template", source_id_template)
+
+    discover = args.discover if args.discover is not None else prompt_bool("Supports discover?", True)
+    refresh = args.refresh if args.refresh is not None else prompt_bool("Supports refresh?", True)
+    tracking_mode = args.tracking_mode or prompt("Tracking mode", "snapshot")
+    if tracking_mode not in ("snapshot", "cursor", "none"):
+        die("tracking mode must be one of: snapshot, cursor, none")
+
+    auth_check = args.auth_check or prompt("Auth check command", "")
+    auth_setup = args.auth_setup or prompt("Auth setup instructions", "")
+    discover_run = args.discover_run or (prompt("Discover command", "") if discover else "")
+    fetch_run = args.fetch_run or prompt("Fetch command")
+    refresh_run = args.refresh_check_run or (prompt("Refresh check command", "") if refresh else "")
+    normalize_kind = args.normalize or prompt("Normalize kind", "markdown")
+
+    refs = []
+    for pattern in ref_patterns:
+        refs.append({
+            "pattern": pattern,
+            "source-ref": source_ref_template,
+            "source-id": source_id_template,
+        })
+
+    data = {
+        "id": connector_id,
+        "name": name,
+        "description": description,
+        "refs": refs,
+        "auth": {
+            "check": {"run": auth_check},
+            "setup": {"instructions": auth_setup},
+        },
+        "capabilities": {
+            "discover": bool(discover),
+            "fetch": True,
+            "refresh": bool(refresh),
+        },
+        "fetch": {
+            "run": fetch_run,
+            "body": {"file": "{{tmp_body}}"},
+        },
+        "normalize": {"kind": normalize_kind},
+        "tracking": {
+            "identity": source_id_template,
+            "cursor": "opaque" if tracking_mode == "cursor" else tracking_mode,
+        },
+    }
+    if discover:
+        data["discover"] = {"run": discover_run, "output": "json"}
+    if refresh:
+        data["refresh"] = {"check": {"run": refresh_run, "output": "json"}}
+
+    out_path = os.path.abspath(args.output or os.path.join(connectors_dir(), "%s.yml" % connector_id))
+    if os.path.exists(out_path) and not args.force:
+        die("connector file already exists: %s (pass --force to overwrite)" % out_path)
+    ensure_dir(os.path.dirname(out_path))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    display_path = relpath(out_path, REPO_ROOT) if (out_path == REPO_ROOT or out_path.startswith(REPO_ROOT + os.sep)) else out_path
+    print("Wrote %s" % display_path)
+    if args.sample_ref:
+        tmp = dict(data)
+        tmp["__path__"] = out_path
+        hit = match_connector_ref(tmp, args.sample_ref)
+        if hit:
+            print("Sample ref matched:")
+            print(json.dumps(hit, indent=2, ensure_ascii=False))
+        else:
+            print("Sample ref did not match any configured pattern.")
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="memoria", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_project(p):
+        p.add_argument("--project", required=True, help="project slug (folder under projects/)")
+
+    p = sub.add_parser("rebuild-inventory", help="regenerate inventory.md from frontmatter")
+    add_project(p)
+    p.add_argument("--no-log", action="store_true", help="don't append the 'Inventory rebuilt' log note")
+    p.set_defaults(func=cmd_rebuild_inventory)
+
+    p = sub.add_parser("status", help="print a read-only status snapshot")
+    add_project(p)
+    p.add_argument("--log-limit", type=int, default=20, help="number of recent log entries to show")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("log", help="append one entry to log.jsonl")
+    add_project(p)
+    p.add_argument("--kind", required=True, help="event kind (e.g. decision.logged, meeting.recorded, note)")
+    p.add_argument("--summary", required=True, help="one-line summary")
+    p.add_argument("--tags", help="comma-separated tags")
+    p.add_argument("--resource", help="relative path to a related resource")
+    p.add_argument("--corrects", help="ts of a prior entry this one corrects")
+    p.add_argument("--quiet", action="store_true", help="don't echo the appended line")
+    p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("new-resource", help="write a resource file + log it + refresh inventory")
+    add_project(p)
+    p.add_argument("--category", required=True, help="resources/ subfolder (created if missing)")
+    p.add_argument("--title", required=True)
+    p.add_argument("--type", required=True, help="free-form type (note, decision, conversation, …)")
+    p.add_argument("--source", required=True, help="free-form source (manual, notion, google-doc, …)")
+    p.add_argument("--source-ref", required=True, dest="source_ref", help="url, path, id, or 'manual'")
+    p.add_argument("--source-id", dest="source_id", help="optional stable source identifier")
+    p.add_argument("--connector", help="optional connector id used for fetch/refresh")
+    p.add_argument("--source-updated", dest="source_updated", help="optional source-side updated timestamp")
+    p.add_argument("--summary", help="one-line summary for inventory + log")
+    p.add_argument("--tags", help="comma-separated tags")
+    p.add_argument("--created", help="ISO date (defaults to today)")
+    p.add_argument("--filename", help="override the computed <date>-<slug>.md filename")
+    p.add_argument("--source-created", dest="source_created", help="optional original creation date")
+    p.add_argument("--source-cursor", dest="source_cursor",
+                   help="opaque high-water mark for tail-forward sources, e.g. 'slack-ts:<latest message ts>'")
+    p.add_argument("--body-file", dest="body_file", help="read body from this file (else stdin)")
+    p.add_argument("--fetch-log", dest="fetch_log", action="store_true",
+                   help="also append a fetch.completed log entry (for sync-sources)")
+    p.add_argument("--no-inventory", dest="no_inventory", action="store_true",
+                   help="skip the inventory rebuild (batch writes; rebuild once at the end)")
+    p.set_defaults(func=cmd_new_resource)
+
+    p = sub.add_parser("update-resource", help="replace a resource body, bump updated, log it")
+    add_project(p)
+    p.add_argument("--path", required=True, help="resource path relative to the project dir")
+    p.add_argument("--change", required=True, help="one-line change summary for the log")
+    p.add_argument("--updated", help="ISO date to set (defaults to today)")
+    p.add_argument("--summary", help="override the summary frontmatter")
+    p.add_argument("--title", help="override the title frontmatter")
+    p.add_argument("--tags", help="override tags (comma-separated)")
+    p.add_argument("--source", help="source label for the log entry (defaults to existing frontmatter)")
+    p.add_argument("--connector", help="override connector frontmatter")
+    p.add_argument("--source-id", dest="source_id", help="override source-id frontmatter")
+    p.add_argument("--source-updated", dest="source_updated", help="override source-updated frontmatter")
+    p.add_argument("--source-cursor", dest="source_cursor",
+                   help="advance the tail-forward cursor, e.g. 'slack-ts:<new latest ts>' (added if absent)")
+    p.add_argument("--body-file", dest="body_file", help="read new body from this file (else stdin)")
+    p.add_argument("--no-inventory", dest="no_inventory", action="store_true", help="skip the inventory rebuild")
+    p.set_defaults(func=cmd_update_resource)
+
+    p = sub.add_parser("init", help="scaffold a new project from _template/")
+    add_project(p)
+    p.add_argument("--title", required=True)
+    p.add_argument("--owner", required=True)
+    p.add_argument("--status", help="project status (default: discovery)")
+    p.add_argument("--goal", help="one-paragraph goal")
+    p.add_argument("--description", help="one-paragraph description (defaults to the goal)")
+    p.add_argument("--created", help="ISO date (defaults to today)")
+    p.add_argument("--key-link", dest="key_link", action="append", metavar="LABEL=URL", help="repeatable")
+    p.add_argument("--collaborator", action="append", help="repeatable")
+    p.add_argument("--stakeholder", action="append", help="repeatable")
+    p.add_argument("--glossary", action="append", metavar="TERM=DEF", help="repeatable")
+    p.add_argument("--contributor", metavar="NAME[=slug]",
+                   help="contributions-note person (defaults to the project owner)")
+    p.add_argument("--no-contributions", dest="no_contributions", action="store_true",
+                   help="don't seed a contributions note")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("connector", help="inspect connector definitions")
+    csub = p.add_subparsers(dest="connector_command", required=True)
+
+    c = csub.add_parser("list", help="list connectors in connectors/")
+    c.set_defaults(func=cmd_connector_list)
+
+    c = csub.add_parser("show", help="show one connector definition")
+    c.add_argument("--id", required=True, help="connector id")
+    c.set_defaults(func=cmd_connector_show)
+
+    c = csub.add_parser("match", help="match a reference against the connector registry")
+    c.add_argument("--ref", required=True, help="reference to match")
+    c.add_argument("--connector", help="restrict matching to one connector id")
+    c.add_argument("--json", action="store_true", help="emit matches as JSON")
+    c.set_defaults(func=cmd_connector_match)
+
+    memoria_rag.add_rag_subparser(sub, add_project)
+
+    p = sub.add_parser("setup", help="generate harness adapters or scaffold a connector")
+    ssub = p.add_subparsers(dest="setup_command", required=True)
+
+    s = ssub.add_parser("agent", help="generate adapter files for a harness")
+    s.add_argument("--harness", choices=HARNESSES, help="claude, pi, codex, opencode, or generic")
+    s.add_argument("--dest", help="destination root (defaults to this repo)")
+    s.add_argument("--mode", choices=["skip", "overwrite", "abort"], default="skip",
+                   help="what to do if a target file already exists")
+    s.add_argument("--tracking", choices=["commit", "ignore", "local-only"], default="commit",
+                   help="whether generated files should be committed, added to .gitignore, or kept local-only")
+    s.add_argument("--dry-run", action="store_true", help="show what would be written")
+    s.set_defaults(func=cmd_setup_agent)
+
+    s = ssub.add_parser("connector", help="scaffold a connector definition")
+    s.add_argument("--id", help="connector id")
+    s.add_argument("--name", help="display name")
+    s.add_argument("--description", help="short description")
+    s.add_argument("--ref-pattern", action="append", help="regex that identifies a supported ref (repeatable)")
+    s.add_argument("--source-ref-template", help="template for source-ref (default: {{url}})")
+    s.add_argument("--source-id-template", help="template for source-id")
+    s.add_argument("--auth-check", help="command used to verify auth")
+    s.add_argument("--auth-setup", help="setup/login instructions")
+    s.add_argument("--discover", action="store_true", default=None, help="mark discover capability on")
+    s.add_argument("--no-discover", dest="discover", action="store_false", help="mark discover capability off")
+    s.add_argument("--discover-run", help="discover/search command")
+    s.add_argument("--fetch-run", help="fetch command")
+    s.add_argument("--refresh", action="store_true", default=None, help="mark refresh capability on")
+    s.add_argument("--no-refresh", dest="refresh", action="store_false", help="mark refresh capability off")
+    s.add_argument("--refresh-check-run", help="refresh metadata check command")
+    s.add_argument("--normalize", help="normalization kind (markdown, text, json, html, custom)")
+    s.add_argument("--tracking-mode", choices=["snapshot", "cursor", "none"], help="resource tracking model")
+    s.add_argument("--sample-ref", help="optional sample ref to test against the generated connector")
+    s.add_argument("--output", help="output path (defaults to connectors/<id>.yml)")
+    s.add_argument("--force", action="store_true", help="overwrite an existing connector file")
+    s.set_defaults(func=cmd_setup_connector)
+
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

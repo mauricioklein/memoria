@@ -1,0 +1,34 @@
+{
+  "id": "example-internal-wiki",
+  "name": "Example internal wiki",
+  "description": "Fake proprietary connector example for open-source documentation.",
+  "refs": [
+    {
+      "pattern": "wiki://(?P<page_id>.+)",
+      "source-ref": "wiki://{{page_id}}",
+      "source-id": "{{page_id}}"
+    }
+  ],
+  "auth": {
+    "check": { "run": "internal-wiki auth status" },
+    "setup": { "instructions": "Run internal-wiki login and complete SSO." }
+  },
+  "capabilities": { "discover": true, "fetch": true, "refresh": true },
+  "discover": {
+    "run": "internal-wiki search --query '{{query}}' --limit {{limit}} --json",
+    "output": "json"
+  },
+  "fetch": {
+    "run": "internal-wiki page export {{source_id}} --format markdown --out '{{tmp_body}}'",
+    "body": { "file": "{{tmp_body}}" }
+  },
+  "refresh": {
+    "check": {
+      "run": "internal-wiki page meta {{source_id}} --json",
+      "output": "json",
+      "updated-at": "$.updated_at"
+    }
+  },
+  "normalize": { "kind": "markdown" },
+  "tracking": { "identity": "{{source_id}}", "cursor": "none" }
+}

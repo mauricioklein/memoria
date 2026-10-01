@@ -1,0 +1,39 @@
+{
+  "id": "notion",
+  "name": "Notion",
+  "description": "Import a Notion page via the Notion MCP tools.",
+  "refs": [
+    {
+      "pattern": "https://www\\.notion\\.so/[^\\s]+/(?P<id>[A-Za-z0-9-]+)",
+      "source-ref": "{{url}}",
+      "source-id": "{{id}}"
+    },
+    {
+      "pattern": "(?P<id>[A-Fa-f0-9-]{32,36})",
+      "source-ref": "{{id}}",
+      "source-id": "{{id}}"
+    }
+  ],
+  "auth": {
+    "check": { "run": "Notion MCP server connected" },
+    "setup": { "instructions": "Connect a Notion MCP server for the active harness." }
+  },
+  "capabilities": { "discover": true, "fetch": true, "refresh": true },
+  "discover": {
+    "run": "mcp__notion__notion-search { \"query\": \"{{query}}\" }",
+    "output": "json"
+  },
+  "fetch": {
+    "run": "mcp__notion__notion-fetch { \"id\": \"{{source_ref}}\" }",
+    "body": { "file": "{{tmp_body}}" }
+  },
+  "refresh": {
+    "check": {
+      "run": "mcp__notion__notion-fetch { \"id\": \"{{source_ref}}\" }",
+      "output": "json",
+      "updated-at": "$.last_edited_time"
+    }
+  },
+  "normalize": { "kind": "markdown" },
+  "tracking": { "identity": "{{source_id}}", "cursor": "none" }
+}

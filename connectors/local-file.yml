@@ -1,0 +1,33 @@
+{
+  "id": "local-file",
+  "name": "Local file",
+  "description": "Import a local file or directory path.",
+  "refs": [
+    {
+      "pattern": "^(?P<path>/.*|\\./.*|\\.\\./.*)$",
+      "source-ref": "{{path}}",
+      "source-id": "{{path}}"
+    }
+  ],
+  "auth": {
+    "check": { "run": "local filesystem access" },
+    "setup": { "instructions": "No auth required." }
+  },
+  "capabilities": { "discover": true, "fetch": true, "refresh": true },
+  "discover": {
+    "run": "fd <pattern> <dir> or rg '<query>' <dir> -l",
+    "output": "text"
+  },
+  "fetch": {
+    "run": "Use the Read tool on {{source_ref}}",
+    "body": { "file": "{{tmp_body}}" }
+  },
+  "refresh": {
+    "check": {
+      "run": "stat mtime for {{source_ref}}",
+      "output": "text"
+    }
+  },
+  "normalize": { "kind": "markdown-or-text" },
+  "tracking": { "identity": "{{source_id}}", "cursor": "none" }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "web",
+  "name": "Web",
+  "description": "Import a generic web page.",
+  "refs": [
+    {
+      "pattern": "^https?://",
+      "source-ref": "{{url}}",
+      "source-id": "{{url}}"
+    }
+  ],
+  "auth": {
+    "check": { "run": "HTTP access available" },
+    "setup": { "instructions": "No auth required unless the target site needs it." }
+  },
+  "capabilities": { "discover": true, "fetch": true, "refresh": true },
+  "discover": {
+    "run": "Use the harness's web search tool",
+    "output": "text"
+  },
+  "fetch": {
+    "run": "Use the harness's web fetch tool with readability/markdown extraction",
+    "body": { "file": "{{tmp_body}}" }
+  },
+  "refresh": {
+    "check": {
+      "run": "No cheap freshness check; re-fetch",
+      "output": "text"
+    }
+  },
+  "normalize": { "kind": "markdown" },
+  "tracking": { "identity": "{{source_id}}", "cursor": "none" }
+}

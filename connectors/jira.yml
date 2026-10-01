@@ -1,0 +1,34 @@
+{
+  "id": "jira",
+  "name": "Jira",
+  "description": "Import a Jira work item via acli.",
+  "refs": [
+    {
+      "pattern": "(?P<key>[A-Z][A-Z0-9]+-[0-9]+)",
+      "source-ref": "{{key}}",
+      "source-id": "{{key}}"
+    }
+  ],
+  "auth": {
+    "check": { "run": "acli jira auth status" },
+    "setup": { "instructions": "Run: acli jira auth login" }
+  },
+  "capabilities": { "discover": true, "fetch": true, "refresh": true },
+  "discover": {
+    "run": "acli jira workitem search --jql '{{query}}' --fields summary,status,updated --limit {{limit}} --json",
+    "output": "json"
+  },
+  "fetch": {
+    "run": "acli jira workitem view {{source_id}} --fields summary,status,assignee,labels,description,comments,created,updated --json",
+    "body": { "file": "{{tmp_body}}" }
+  },
+  "refresh": {
+    "check": {
+      "run": "acli jira workitem view {{source_id}} --fields updated --json",
+      "output": "json",
+      "updated-at": "$.updated"
+    }
+  },
+  "normalize": { "kind": "jira-ticket" },
+  "tracking": { "identity": "{{source_id}}", "cursor": "none" }
+}

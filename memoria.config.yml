@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "paths": {
+    "projects": "projects",
+    "connectors": "connectors",
+    "docs": "docs",
+    "adapters": "adapters"
+  },
+  "setup": {
+    "defaultHarnessDest": ".",
+    "defaultOverwriteMode": "skip",
+    "defaultTracking": "commit"
+  }
+}

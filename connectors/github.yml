@@ -1,0 +1,35 @@
+{
+  "id": "github",
+  "name": "GitHub",
+  "description": "Import a GitHub issue or pull request via gh.",
+  "refs": [
+    {
+      "pattern": "https://github\\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>[0-9]+)",
+      "source-ref": "{{url}}",
+      "source-id": "{{owner}}/{{repo}}#{{number}}"
+    },
+    {
+      "pattern": "https://github\\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>[0-9]+)",
+      "source-ref": "{{url}}",
+      "source-id": "{{owner}}/{{repo}}#{{number}}"
+    }
+  ],
+  "auth": {
+    "check": { "run": "gh auth status" },
+    "setup": { "instructions": "Run: gh auth login" }
+  },
+  "capabilities": { "discover": false, "fetch": true, "refresh": true },
+  "fetch": {
+    "run": "gh issue view or gh pr view depending on the matched ref",
+    "body": { "file": "{{tmp_body}}" }
+  },
+  "refresh": {
+    "check": {
+      "run": "gh issue view/gh pr view with --json updatedAt",
+      "output": "json",
+      "updated-at": "$.updatedAt"
+    }
+  },
+  "normalize": { "kind": "github-thread" },
+  "tracking": { "identity": "{{source_id}}", "cursor": "none" }
+}

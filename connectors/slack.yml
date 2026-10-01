@@ -1,0 +1,38 @@
+{
+  "id": "slack",
+  "name": "Slack",
+  "description": "Import a Slack thread or tail a Slack channel via MCP-backed tools.",
+  "refs": [
+    {
+      "pattern": "https://[^/]+\\.slack\\.com/archives/(?P<channel_id>[A-Z0-9]+)/p(?P<ts_digits>[0-9]+)",
+      "source-ref": "{{url}}",
+      "source-id": "{{channel_id}}:{{ts_digits}}"
+    },
+    {
+      "pattern": "slack-channel:(?P<channel_id>[A-Z0-9]+)",
+      "source-ref": "slack-channel:{{channel_id}}",
+      "source-id": "{{channel_id}}"
+    }
+  ],
+  "auth": {
+    "check": { "run": "Slack MCP server connected" },
+    "setup": { "instructions": "Connect a Slack MCP server for the active harness." }
+  },
+  "capabilities": { "discover": true, "fetch": true, "refresh": true },
+  "discover": {
+    "run": "mcp__slack__slack_search_public_and_private { \"query\": \"{{query}}\" }",
+    "output": "json"
+  },
+  "fetch": {
+    "run": "mcp__slack__slack_read_thread or mcp__slack__slack_read_channel depending on the matched ref",
+    "body": { "file": "{{tmp_body}}" }
+  },
+  "refresh": {
+    "check": {
+      "run": "For threads, compare reply_count/latest_reply. For channels, read newer messages after source-cursor.",
+      "output": "json"
+    }
+  },
+  "normalize": { "kind": "slack-thread" },
+  "tracking": { "identity": "{{source_id}}", "cursor": "slack-ts" }
+}
