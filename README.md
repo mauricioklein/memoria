@@ -1,6 +1,6 @@
 # Memoria
 
-[Test workflow](https://github.com/mauricioklein/memoria-sanitized/actions/workflows/test.yml)
+[![Tests](https://github.com/mauricioklein/memoria-sanitized/actions/workflows/test.yml/badge.svg)](https://github.com/mauricioklein/memoria-sanitized/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
 [![stdlib only](https://img.shields.io/badge/deps-stdlib%20only-brightgreen.svg)]()
